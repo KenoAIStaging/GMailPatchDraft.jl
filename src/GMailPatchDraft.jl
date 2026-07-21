@@ -303,12 +303,56 @@ function patch_to_rfc822(raw::AbstractString; to = String[], cc = String[])
     return String(take!(io))
 end
 
-# The API wants the hex threadId. The Gmail UI's "Show original" URL exposes
-# the decimal form (permmsgid=msg-f:<decimal>; the thread's id is its first
-# message's id) — accept msg-f:/thread-f: prefixed decimals and convert.
+# The new Gmail UI's URL fragment identifies a thread with an opaque token
+# like "FMfcgzQhVWwLZMnDwNWCdxPKKSXRLgKp": one large number in base 40 over a
+# vowel-free alphabet which, re-expressed in base 64 and base64-decoded,
+# yields "thread-f:<decimal>" (scheme reverse-engineered by Arsenal Recon's
+# GmailURLDecoder). Returns the decoded string, or nothing if it doesn't fit
+# the scheme.
+const UI_TOKEN_CHARSET = "BCDFGHJKLMNPQRSTVWXZbcdfghjklmnpqrstvwxz"
+const B64_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+function decode_ui_token(token::AbstractString)
+    v = big(0)
+    for c in token
+        i = findfirst(==(c), UI_TOKEN_CHARSET)
+        i === nothing && return nothing
+        v = v * 40 + (i - 1)
+    end
+    digits = Int[]
+    while v > 0
+        push!(digits, Int(v % 64))
+        v ÷= 64
+    end
+    b64 = String([B64_CHARSET[d+1] for d in reverse(digits)])
+    return try
+        String(base64decode(b64 * "="^mod(-length(b64), 4)))
+    catch
+        nothing
+    end
+end
+
+"""
+Normalize a user-supplied thread id to the hex form the API wants. Accepts:
+the hex API threadId itself; `msg-f:<decimal>`/`thread-f:<decimal>` as found
+in the UI's "Show original" URL (a thread's id equals its first message's id);
+or the new UI's URL-fragment token (`FMfcgz…`), which encodes thread-f.
+"""
 function normalize_thread_id(s::AbstractString)
     m = match(r"^(?:msg-f|thread-f):(\d+)$", s)
-    return m === nothing ? String(s) : string(parse(UInt64, m.captures[1]); base = 16)
+    m === nothing || return string(parse(UInt64, m.captures[1]); base = 16)
+    if occursin(r"^[BCDFGHJKLMNPQRSTVWXZbcdfghjklmnpqrstvwxz]{28,}$", s)
+        dec = decode_ui_token(s)
+        if dec !== nothing
+            dm = match(r"^(?:thread-)?(?:msg-)?f:(\d+)$", dec)
+            dm === nothing || return string(parse(UInt64, dm.captures[1]); base = 16)
+            occursin(r"\ba:", dec) && error(
+                "thread token decodes to \"$dec\" — an \"a:\" id has no legacy hex form " *
+                "the API accepts; use msg-f:<decimal> from \"Show original\" on a " *
+                "received message of the thread instead")
+        end
+    end
+    return String(s)
 end
 
 function create_draft(access_token::String, rfc822::String; thread_id = nothing)
@@ -494,9 +538,9 @@ function print_usage(io::IO = stdout)
               Create one Gmail draft per .patch file ("-" reads stdin).
               --thread-id attaches the draft(s) to an existing Gmail thread —
               required for a reply to thread correctly when sent from the
-              Gmail UI. Accepts the hex API threadId or msg-f:<decimal> as
-              found in the UI's "Show original" URL (of the thread's first
-              message).
+              Gmail UI. Accepts the hex API threadId, msg-f:<decimal> from the
+              UI's "Show original" URL, or the FMfcgz… token straight from the
+              Gmail web UI's URL bar when viewing the thread.
 
           $SERVICE reply LORE_URL [-o FILE]
               Fetch a message from lore.kernel.org and write an editable

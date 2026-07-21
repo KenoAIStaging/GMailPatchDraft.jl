@@ -64,7 +64,7 @@ git format-patch --stdout -1 HEAD | gmail-patch-draft draft --to reviewer@exampl
 # (git config user.email) is dropped.
 gmail-patch-draft reply https://lore.kernel.org/lkml/87bjc0led9.ffs@fw13/
 $EDITOR reply-87bjc0led9.ffs@fw13.txt
-gmail-patch-draft draft --thread-id msg-f:1636245846315289078 reply-87bjc0led9.ffs@fw13.txt
+gmail-patch-draft draft --thread-id FMfcgzQhVWwLZMnDwNWCdxPKKSXRLgKp reply-87bjc0led9.ffs@fw13.txt
 
 # Forget the stored credentials:
 gmail-patch-draft logout
@@ -93,12 +93,23 @@ so for replies pass it manually:
 gmail-patch-draft draft --thread-id ID reply-….txt
 ```
 
-`ID` is either the hex API threadId, or `msg-f:<decimal>` / `thread-f:<decimal>`
-as found in the Gmail UI: open the **first** message of the thread →
-⋮ → "Show original" — the URL contains `permmsgid=msg-f:<decimal>` (a thread's
-id equals its first message's id). With the draft attached to the thread, the
-UI composer treats it as a reply to that conversation and generates correct
-threading headers itself at send time.
+`ID` accepts any of:
+
+- the token in the Gmail web UI's URL bar while viewing the thread
+  (`#inbox/FMfcgzQhVWwLZMnDwNWCdxPKKSXRLgKp`) — easiest. It's a base-40
+  encoding of `thread-f:<decimal>` (scheme reverse-engineered by
+  [Arsenal Recon's GmailURLDecoder](https://github.com/ArsenalRecon/GmailURLDecoder))
+  and is decoded locally. Threads whose token decodes to an `a:` id (threads
+  you started from the new Gmail composer) have no hex API id — use the
+  `msg-f:` form of a *received* message in the thread instead;
+- `msg-f:<decimal>` / `thread-f:<decimal>` from the UI's "Show original" view
+  of the thread's **first** message (`permmsgid=msg-f:<decimal>` in its URL —
+  a thread's id equals its first message's id);
+- the hex API threadId itself.
+
+With the draft attached to the thread, the UI composer treats it as a reply
+to that conversation and generates correct threading headers itself at send
+time.
 
 One caveat for patches (as opposed to prose replies): the UI's Send button
 also re-wraps long lines and converts tabs, which corrupts a patch for

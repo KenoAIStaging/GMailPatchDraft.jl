@@ -19,6 +19,11 @@ end
           string(UInt64(1636245846315289078); base = 16)
     @test normalize_thread_id("thread-f:1636245846315289078") ==
           string(UInt64(1636245846315289078); base = 16)
+    # the new UI's URL-fragment token (base-40 encoding of thread-f:<decimal>;
+    # expected value cross-checked against Arsenal Recon's GmailURLDecoder)
+    @test normalize_thread_id("FMfcgzQhVWwLZMnDwNWCdxPKKSXRLgKp") == "19f82b4e90a11791"
+    # not a UI token (contains vowels/digits) → passed through untouched
+    @test normalize_thread_id("FMfcgzQaVWwLZMnDwNWCdxPKKSXRLgK0") == "FMfcgzQaVWwLZMnDwNWCdxPKKSXRLgK0"
 end
 
 @testset "build_reply" begin
