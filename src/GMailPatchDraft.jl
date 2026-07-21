@@ -8,7 +8,11 @@ using SHA: sha256
 using Sockets
 
 const SERVICE = "gmail-patch-draft"
-const SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+# The granular drafts-only scope (visible in the Cloud Console's scope list;
+# the API reference still lags behind). Override with $GMAIL_SCOPE — e.g. set it
+# to .../auth/gmail.compose for projects where the granular scope isn't offered.
+const DEFAULT_SCOPE = "https://www.googleapis.com/auth/gmail.drafts.create"
+scope() = get(ENV, "GMAIL_SCOPE", DEFAULT_SCOPE)
 const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 # Media upload avoids double base64: the RFC 822 message is the request body.
@@ -122,7 +126,7 @@ function oauth_authorize(client_id::String, client_secret::String)
         "client_id" => client_id,
         "redirect_uri" => redirect_uri,
         "response_type" => "code",
-        "scope" => SCOPE,
+        "scope" => scope(),
         "access_type" => "offline",
         "prompt" => "consent",
         "state" => state,
@@ -225,7 +229,8 @@ function print_usage(io::IO = stdout)
               Delete the stored credentials.
 
         Requires a Google Cloud OAuth client of type "Desktop app" with the
-        Gmail API enabled (scope: gmail.compose). See the README for setup.
+        Gmail API enabled (scope: gmail.drafts.create, overridable via
+        \$GMAIL_SCOPE). See the README for setup.
         """)
 end
 

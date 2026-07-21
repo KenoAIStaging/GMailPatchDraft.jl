@@ -19,8 +19,12 @@ for the API responses; everything else is stdlib.
    Note the client ID and client secret. (For installed apps the "secret" is
    not actually confidential; PKCE is used regardless.)
 
-The requested scope is `https://www.googleapis.com/auth/gmail.compose` — the
-narrowest scope that permits `drafts.create`.
+The requested scope is `https://www.googleapis.com/auth/gmail.drafts.create` —
+the granular drafts-only scope (it cannot send mail, unlike `gmail.compose`).
+It appears in the Cloud Console's scope list even though the Gmail API
+reference docs still lag behind. If your project doesn't offer it, set
+`GMAIL_SCOPE=https://www.googleapis.com/auth/gmail.compose` before running
+`auth` to fall back to the older scope.
 
 ## Install
 
