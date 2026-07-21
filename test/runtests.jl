@@ -48,11 +48,45 @@ end
          1 file changed, 1 insertion(+)
         """
     msg = patch_to_rfc822(patch; to = ["a@example.com", "b@example.com"], cc = ["c@example.com"])
-    @test startswith(msg, "To: a@example.com, b@example.com\nCc: c@example.com\nFrom: Keno Fischer")
+    @test startswith(msg, "From: Keno Fischer")
+    @test occursin("\nTo: a@example.com,\n    b@example.com\n", msg)
+    @test occursin("\nCc: c@example.com\n", msg)
     @test !occursin("Mon Sep 17 00:00:00 2001", msg)
     @test occursin("Subject: [PATCH] Fix the frobnicator", msg)
+    @test endswith(msg, "\n\n---\n a.txt | 1 +\n 1 file changed, 1 insertion(+)\n")
 
     # no mbox separator, no recipients → message unchanged
     plain = "From: x@y.z\nSubject: s\n\nbody\n"
     @test patch_to_rfc822(plain) == plain
+
+    # To:/Cc: already present in the patch (git format-patch --to/--cc writes
+    # them verbatim, unencoded, possibly folded) get re-encoded and merged
+    kernel = """
+        From 430ce869f34b548ff57ea9539a1187e739f3b96e Mon Sep 17 00:00:00 2001
+        From: Keno Fischer <keno@juliahub.com>
+        Date: Tue, 21 Jul 2026 00:31:48 +0000
+        Subject: [PATCH] futex: Prevent robust futex exit race more
+        To: Thomas Gleixner <tglx@kernel.org>,
+            Ingo Molnar <mingo@redhat.com>
+        Cc: Darren Hart <dvhart@infradead.org>,
+            André Almeida <andrealmeid@igalia.com>,
+            stable@vger.kernel.org
+
+        André fixed this before.
+        Cc: stable@vger.kernel.org
+        ---
+         kernel/futex/core.c | 1 +
+        """
+    msg = patch_to_rfc822(kernel; cc = ["extra@example.com", "stable@vger.kernel.org"])
+    hdr, body = split(msg, "\n\n"; limit = 2)
+    # no raw non-ASCII survives in the headers; the name is an encoded-word
+    @test isascii(hdr)
+    @test occursin("=?UTF-8?B?$(base64encode("André Almeida"))?= <andrealmeid@igalia.com>", hdr)
+    @test occursin("To: Thomas Gleixner <tglx@kernel.org>,\n    Ingo Molnar <mingo@redhat.com>", hdr)
+    # CLI --cc merged into the single Cc: header, duplicates dropped
+    @test length(collect(eachmatch(r"^Cc: "m, hdr))) == 1
+    @test occursin("extra@example.com", hdr)
+    @test length(collect(eachmatch(r"stable@vger\.kernel\.org", hdr))) == 1
+    # body (including its trailer lines and non-ASCII text) is untouched
+    @test body == "André fixed this before.\nCc: stable@vger.kernel.org\n---\n kernel/futex/core.c | 1 +\n"
 end

@@ -214,23 +214,92 @@ function format_address(addr::AbstractString)
     return "$name <$email>"
 end
 
+# Split a header block into logical headers, keeping the original (possibly
+# folded) text alongside the unfolded single-line value.
+function unfold_headers(hdr::AbstractString)
+    logical = Tuple{String,String}[]
+    lines = split(hdr, '\n')
+    i = 1
+    while i <= length(lines)
+        orig = IOBuffer(); unfolded = IOBuffer()
+        print(orig, lines[i]); print(unfolded, lines[i])
+        i += 1
+        while i <= length(lines) && startswith(lines[i], r"[ \t]")
+            print(orig, '\n', lines[i])
+            print(unfolded, ' ', strip(lines[i]))
+            i += 1
+        end
+        push!(logical, (String(take!(orig)), String(take!(unfolded))))
+    end
+    return logical
+end
+
+# Split an address list on commas, ignoring commas inside quoted strings
+# ("Almeida, Andre" <a@b.c>).
+function split_addresses(s::AbstractString)
+    parts = String[]
+    buf = IOBuffer()
+    inquote = escaped = false
+    for c in s
+        if escaped
+            print(buf, c); escaped = false
+        elseif c == '\\' && inquote
+            print(buf, c); escaped = true
+        elseif c == '"'
+            print(buf, c); inquote = !inquote
+        elseif c == ',' && !inquote
+            p = strip(String(take!(buf)))
+            isempty(p) || push!(parts, p)
+        else
+            print(buf, c)
+        end
+    end
+    p = strip(String(take!(buf)))
+    isempty(p) || push!(parts, p)
+    return parts
+end
+
 """
 Turn `git format-patch` output into an RFC 822 message for Gmail.
 
-format-patch already emits a valid message (From/Date/Subject headers + body);
-we only strip the leading mbox separator (`From <sha> Mon Sep 17 00:00:00 2001`)
-— distinguishable from a real header because it has no colon — and prepend
-optional To/Cc headers.
+format-patch already emits a valid message (From/Date/Subject headers + body),
+so the body passes through verbatim. In the headers we strip the leading mbox
+separator (`From <sha> Mon Sep 17 00:00:00 2001` — distinguishable from a real
+header because it has no colon) and rebuild the To:/Cc: headers: format-patch
+writes `--to`/`--cc` recipients into the patch verbatim and leaves the RFC 2047
+encoding of non-ASCII names to `git send-email`, so since we replace
+send-email here, that re-encoding (via [`format_address`](@ref)) is our job.
+CLI-provided recipients are merged into the same headers.
 """
 function patch_to_rfc822(raw::AbstractString; to = String[], cc = String[])
     if startswith(raw, "From ")
         nl = findfirst('\n', raw)
         raw = nl === nothing ? "" : SubString(raw, nl + 1)
     end
+    sep = findfirst("\n\n", raw)
+    hdr = sep === nothing ? String(raw) : String(SubString(raw, 1, first(sep) - 1))
+    body = sep === nothing ? "" : String(SubString(raw, last(sep) + 1))
+
+    to_list = String[]; cc_list = String[]; kept = String[]
+    for (orig, unfolded) in unfold_headers(hdr)
+        m = match(r"^(To|Cc):\s*(.*)$"i, unfolded)
+        if m !== nothing
+            dest = lowercase(m.captures[1]) == "to" ? to_list : cc_list
+            append!(dest, split_addresses(m.captures[2]))
+        else
+            push!(kept, orig)
+        end
+    end
+    append!(to_list, to)
+    append!(cc_list, cc)
+
     io = IOBuffer()
-    isempty(to) || println(io, "To: ", join(map(format_address, to), ", "))
-    isempty(cc) || println(io, "Cc: ", join(map(format_address, cc), ", "))
-    write(io, raw)
+    for h in kept
+        println(io, h)
+    end
+    isempty(to_list) || println(io, "To: ", join(unique(map(format_address, to_list)), ",\n    "))
+    isempty(cc_list) || println(io, "Cc: ", join(unique(map(format_address, cc_list)), ",\n    "))
+    print(io, '\n', body)
     return String(take!(io))
 end
 

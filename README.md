@@ -62,10 +62,14 @@ gmail-patch-draft logout
 ```
 
 Each patch becomes one draft; `format-patch` output is already an RFC 822
-message, so the app just strips the leading mbox `From <sha> …` separator,
-prepends `To:`/`Cc:` if given, and uploads it verbatim (`uploadType=media`,
-`Content-Type: message/rfc822`) — attribution, date, and subject survive
-untouched, and `git am` on the receiving end still applies cleanly.
+message, so the app strips the leading mbox `From <sha> …` separator, merges
+`--to`/`--cc` into any `To:`/`Cc:` headers already in the patch, and uploads
+the result (`uploadType=media`, `Content-Type: message/rfc822`). Non-ASCII
+recipient names are RFC 2047-encoded — `format-patch` writes `--to`/`--cc`
+recipients verbatim and normally leaves that to `git send-email`, whose role
+this app takes over. The body passes through byte-for-byte, so attribution,
+date, and subject survive untouched and `git am` on the receiving end still
+applies cleanly.
 
 ## Security notes
 
