@@ -59,8 +59,9 @@ git format-patch --stdout -1 HEAD | gmail-patch-draft draft --to reviewer@exampl
 
 # Reply-all to a list message: fetch it from lore.kernel.org, edit the
 # generated template, then draft it. In-Reply-To/References are set from the
-# original Message-ID, so the draft threads correctly; your own address
-# (git config user.email) is dropped from the recipients.
+# original Message-ID, so the draft threads correctly. To: is the author being
+# replied to, everyone else moves to Cc:, and your own address
+# (git config user.email) is dropped.
 gmail-patch-draft reply https://lore.kernel.org/lkml/87bjc0led9.ffs@fw13/
 $EDITOR reply-87bjc0led9.ffs@fw13.txt
 gmail-patch-draft draft reply-87bjc0led9.ffs@fw13.txt

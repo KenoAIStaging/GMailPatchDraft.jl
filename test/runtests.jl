@@ -33,9 +33,10 @@ end
     reply, msgid = build_reply(msg; my_email = "keno@juliahub.com")
     @test msgid == "<87bjc0led9.ffs@fw13>"
     hdr, body = split(reply, "\n\n"; limit = 2)
-    # sender goes to To:, we are dropped everywhere, To-members not duplicated in Cc
-    @test occursin("To: Thomas Gleixner <tglx@kernel.org>,\n    =?UTF-8?B?QW5kcsOpIEFsbWVpZGE=?= <andrealmeid@igalia.com>", hdr)
-    @test occursin("Cc: linux-kernel@vger.kernel.org", hdr)
+    # only the author goes to To:; original To/Cc recipients move to Cc:,
+    # we are dropped everywhere, and To-members are not duplicated in Cc
+    @test occursin("To: Thomas Gleixner <tglx@kernel.org>\n", hdr)
+    @test occursin("Cc: =?UTF-8?B?QW5kcsOpIEFsbWVpZGE=?= <andrealmeid@igalia.com>,\n    linux-kernel@vger.kernel.org", hdr)
     recipients = split(hdr, "\nSubject:")[1]
     @test !occursin("keno@juliahub.com", recipients)
     @test occursin("Subject: Re: [PATCH] futex: Prevent robust futex exit race more", hdr)

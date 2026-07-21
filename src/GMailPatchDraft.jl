@@ -359,6 +359,7 @@ Build a reply-all template (an editable RFC 822 message) from a raw message as
 served by `https://lore.kernel.org/<list>/<msgid>/raw`. Threading is preserved
 via In-Reply-To/References (plus the matching `Re:` subject), which is what
 both Gmail and the recipients' clients use to place the reply in the thread.
+To: is the author being replied to; the original To/Cc recipients move to Cc.
 `my_email` (typically `git config user.email`) is dropped from the recipients.
 """
 function build_reply(msg::AbstractString; my_email::AbstractString = "")
@@ -382,14 +383,15 @@ function build_reply(msg::AbstractString; my_email::AbstractString = "")
     subject = get(headers, "subject", "")
     occursin(r"^\s*Re:"i, subject) || (subject = "Re: " * subject)
 
-    # reply-all: To = Reply-To (or From) + original To, Cc = original Cc,
-    # minus ourselves and duplicates
+    # reply-all: To = the author (Reply-To, or From), everyone else from the
+    # original To + Cc goes to Cc, minus ourselves and duplicates
     sender = get(headers, "reply-to", get(headers, "from", ""))
     notme(a) = isempty(my_email) || addr_spec(a) != lowercase(strip(my_email))
-    to = unique_by_spec(filter(notme, [split_addresses(sender); split_addresses(get(headers, "to", ""))]))
+    to = unique_by_spec(filter(notme, split_addresses(sender)))
     to_specs = Set(addr_spec.(to))
     cc = unique_by_spec(filter(a -> notme(a) && !in(addr_spec(a), to_specs),
-                               split_addresses(get(headers, "cc", ""))))
+                               [split_addresses(get(headers, "to", ""));
+                                split_addresses(get(headers, "cc", ""))]))
 
     refs = String.(split(get(headers, "references", "")))
     push!(refs, msgid)
