@@ -1,6 +1,5 @@
-using GMailPatchDraft: b64url, build_reply, can_search, decode_rfc2047,
-                       format_address, patch_to_rfc822, qp_decode,
-                       reply_target_msgid
+using GMailPatchDraft: b64url, build_reply, decode_rfc2047, format_address,
+                       normalize_thread_id, patch_to_rfc822, qp_decode
 using Base64: base64decode, base64encode
 using Test
 
@@ -13,20 +12,13 @@ using Test
     @test decode_rfc2047("no encoded words") == "no encoded words"
 end
 
-@testset "reply_target_msgid" begin
-    @test reply_target_msgid("From: a@b.c\nIn-Reply-To: <87bjc0led9.ffs@fw13>\n\nbody") ==
-          "<87bjc0led9.ffs@fw13>"
-    # folded In-Reply-To
-    @test reply_target_msgid("From: a@b.c\nIn-Reply-To:\n <x@y>\n\nbody") == "<x@y>"
-    # falls back to the last References entry
-    @test reply_target_msgid("From: a@b.c\nReferences: <one@x>\n    <two@y>\n\nbody") == "<two@y>"
-    @test reply_target_msgid("From: a@b.c\nSubject: s\n\nbody") === nothing
-    # a "In-Reply-To:" line in the body is not a header
-    @test reply_target_msgid("From: a@b.c\n\nIn-Reply-To: <not@header>\n") === nothing
-
-    @test can_search(Dict("scope" => "a/gmail.drafts.create b/gmail.readonly")) == true
-    @test can_search(Dict("scope" => "a/gmail.drafts.create a/gmail.send")) == false
-    @test can_search(Dict()) == false
+@testset "normalize_thread_id" begin
+    @test normalize_thread_id("16b3a1b2c3d4e5f6") == "16b3a1b2c3d4e5f6"
+    # decimal forms from the Gmail UI's "Show original" URL convert to hex
+    @test normalize_thread_id("msg-f:1636245846315289078") ==
+          string(UInt64(1636245846315289078); base = 16)
+    @test normalize_thread_id("thread-f:1636245846315289078") ==
+          string(UInt64(1636245846315289078); base = 16)
 end
 
 @testset "build_reply" begin
