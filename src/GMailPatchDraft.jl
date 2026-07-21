@@ -179,6 +179,41 @@ end
 # git format-patch → RFC 822 → Gmail draft
 # ---------------------------------------------------------------------------
 
+# RFC 2047 encoded-word (B encoding), chunked so each word stays ≤75 chars
+# ("=?UTF-8?B?" + base64 of ≤45 raw bytes + "?="), split at UTF-8 boundaries.
+function encoded_word(s::AbstractString)
+    words = String[]
+    buf = IOBuffer()
+    for c in s
+        if position(buf) + ncodeunits(c) > 45
+            push!(words, "=?UTF-8?B?$(base64encode(take!(buf)))?=")
+        end
+        print(buf, c)
+    end
+    position(buf) > 0 && push!(words, "=?UTF-8?B?$(base64encode(take!(buf)))?=")
+    return join(words, " ")
+end
+
+"""
+Format one `--to`/`--cc` argument as an RFC 822 address. Headers are 7-bit, so
+a non-ASCII display name ("André Almeida <a@b.c>") must become an RFC 2047
+encoded-word — pasting raw UTF-8 into the header shows up as mojibake. ASCII
+names containing specials (e.g. "Almeida, André"'s comma, which would read as
+an address-list separator) are quoted instead.
+"""
+function format_address(addr::AbstractString)
+    m = match(r"^\s*(.*?)\s*<([^<>]+)>\s*$", addr)
+    m === nothing && return String(strip(addr))  # bare address
+    name, email = String(m.captures[1]), m.captures[2]
+    isempty(name) && return "<$email>"
+    if !isascii(name)
+        name = encoded_word(name)
+    elseif occursin(r"[^A-Za-z0-9 !#$%&'*+\-/=?^_`{|}~]", name) && !startswith(name, '"')
+        name = "\"" * replace(name, "\\" => "\\\\", "\"" => "\\\"") * "\""
+    end
+    return "$name <$email>"
+end
+
 """
 Turn `git format-patch` output into an RFC 822 message for Gmail.
 
@@ -193,8 +228,8 @@ function patch_to_rfc822(raw::AbstractString; to = String[], cc = String[])
         raw = nl === nothing ? "" : SubString(raw, nl + 1)
     end
     io = IOBuffer()
-    isempty(to) || println(io, "To: ", join(to, ", "))
-    isempty(cc) || println(io, "Cc: ", join(cc, ", "))
+    isempty(to) || println(io, "To: ", join(map(format_address, to), ", "))
+    isempty(cc) || println(io, "Cc: ", join(map(format_address, cc), ", "))
     write(io, raw)
     return String(take!(io))
 end
