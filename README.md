@@ -19,12 +19,27 @@ for the API responses; everything else is stdlib.
    Note the client ID and client secret. (For installed apps the "secret" is
    not actually confidential; PKCE is used regardless.)
 
-The requested scope is `https://www.googleapis.com/auth/gmail.drafts.create` —
-the granular drafts-only scope (it cannot send mail, unlike `gmail.compose`).
-It appears in the Cloud Console's scope list even though the Gmail API
-reference docs still lag behind. If your project doesn't offer it, set
-`GMAIL_SCOPE=https://www.googleapis.com/auth/gmail.compose` before running
-`auth` to fall back to the older scope.
+Two scopes are requested by default:
+
+- `https://www.googleapis.com/auth/gmail.drafts.create` — the granular
+  drafts-only scope. It appears in the Cloud Console's scope list even though
+  the Gmail API reference docs still lag behind.
+- `https://www.googleapis.com/auth/gmail.send` — for the `send` subcommand,
+  which transmits the message verbatim via `messages.send`. This matters:
+  **sending a draft from the Gmail UI regenerates the headers and re-wraps
+  the body** — `In-Reply-To`/`References` are dropped (so replies lose
+  threading on the recipient side) and patches get line-wrapped. A draft only
+  keeps its thread identity in the UI if the draft resource carries a Gmail
+  `threadId`, and resolving one requires a read scope. `send` sidesteps all
+  of that: the RFC 822 message goes out byte-for-byte.
+
+Set `GMAIL_SCOPE` (space-separated) before `auth` to override. Adding
+`https://www.googleapis.com/auth/gmail.readonly` additionally lets `draft`
+resolve the replied-to message's `threadId` (an `rfc822msgid:` search;
+`gmail.metadata` won't do — it forbids search queries) so reply drafts also
+thread correctly in your own mailbox view. Dropping `gmail.send` makes the
+tool draft-only; `gmail.compose` alone is the fallback for projects where the
+granular scope isn't offered.
 
 ## Install
 
@@ -66,19 +81,23 @@ gmail-patch-draft reply https://lore.kernel.org/lkml/87bjc0led9.ffs@fw13/
 $EDITOR reply-87bjc0led9.ffs@fw13.txt
 gmail-patch-draft draft reply-87bjc0led9.ffs@fw13.txt
 
+# Send verbatim via the API (NOT the Gmail UI's Send button, which would
+# drop In-Reply-To/References and re-wrap the patch):
+gmail-patch-draft send reply-87bjc0led9.ffs@fw13.txt
+
 # Forget the stored credentials:
 gmail-patch-draft logout
 ```
 
-Each patch becomes one draft; `format-patch` output is already an RFC 822
-message, so the app strips the leading mbox `From <sha> …` separator, merges
-`--to`/`--cc` into any `To:`/`Cc:` headers already in the patch, and uploads
-the result (`uploadType=media`, `Content-Type: message/rfc822`). Non-ASCII
+Each patch becomes one message; `format-patch` output is already RFC 822, so
+the app strips the leading mbox `From <sha> …` separator and merges
+`--to`/`--cc` into any `To:`/`Cc:` headers already in the patch. Non-ASCII
 recipient names are RFC 2047-encoded — `format-patch` writes `--to`/`--cc`
 recipients verbatim and normally leaves that to `git send-email`, whose role
 this app takes over. The body passes through byte-for-byte, so attribution,
 date, and subject survive untouched and `git am` on the receiving end still
-applies cleanly.
+applies cleanly. The intended workflow is `draft` → eyeball it in Gmail →
+`send` the same file; the draft is your review copy, not what gets sent.
 
 ## Security notes
 

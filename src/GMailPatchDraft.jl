@@ -9,14 +9,19 @@ using Sockets
 
 const SERVICE = "gmail-patch-draft"
 # The granular drafts-only scope (visible in the Cloud Console's scope list;
-# the API reference still lags behind). Override with $GMAIL_SCOPE — e.g. set it
-# to .../auth/gmail.compose for projects where the granular scope isn't offered.
-const DEFAULT_SCOPE = "https://www.googleapis.com/auth/gmail.drafts.create"
+# the API reference still lags behind), plus gmail.send so `send` can transmit
+# the message verbatim via messages.send — sending a draft from the Gmail UI
+# regenerates the headers and re-wraps the body, losing In-Reply-To and
+# mangling patches. Override with $GMAIL_SCOPE (space-separated); adding
+# gmail.readonly additionally lets `draft` resolve the replied-to message's
+# threadId (an rfc822msgid: search) so drafts thread in your own mailbox view.
+const DEFAULT_SCOPE = "https://www.googleapis.com/auth/gmail.drafts.create " *
+                      "https://www.googleapis.com/auth/gmail.send"
 scope() = get(ENV, "GMAIL_SCOPE", DEFAULT_SCOPE)
 const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
-# Media upload avoids double base64: the RFC 822 message is the request body.
-const DRAFT_UPLOAD_ENDPOINT = "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=media"
+const DRAFTS_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
+const MESSAGES_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 
 b64url(bytes) = String(rstrip(replace(base64encode(bytes), '+' => '-', '/' => '_'), '='))
 
@@ -159,7 +164,7 @@ function oauth_authorize(client_id::String, client_secret::String)
     haskey(tok, "refresh_token") || error(
         "Google returned no refresh_token. Revoke the app's access at " *
         "https://myaccount.google.com/permissions and re-run `$SERVICE auth`.")
-    return String(tok["refresh_token"])
+    return String(tok["refresh_token"]), String(get(tok, "scope", scope()))
 end
 
 "Exchange the stored refresh token for a short-lived access token (kept in memory only)."
@@ -303,12 +308,82 @@ function patch_to_rfc822(raw::AbstractString; to = String[], cc = String[])
     return String(take!(io))
 end
 
-function create_draft(access_token::String, rfc822::String)
-    resp = HTTP.post(DRAFT_UPLOAD_ENDPOINT,
+# The Message-ID this message replies to (In-Reply-To, falling back to the
+# last References entry), or nothing.
+function reply_target_msgid(rfc822::AbstractString)
+    sep = findfirst("\n\n", rfc822)
+    hdr = sep === nothing ? rfc822 : SubString(rfc822, 1, first(sep) - 1)
+    refs = nothing
+    for (_, unfolded) in unfold_headers(hdr)
+        m = match(r"^In-Reply-To:\s*(<[^<>]+>)"i, unfolded)
+        m === nothing || return String(m.captures[1])
+        m = match(r"^References:\s*(.*)$"i, unfolded)
+        m === nothing || (refs = m.captures[1])
+    end
+    refs === nothing && return nothing
+    m = collect(eachmatch(r"<[^<>]+>", refs))
+    return isempty(m) ? nothing : String(m[end].match)
+end
+
+"""
+Find the Gmail threadId of the message with the given RFC 822 Message-ID via
+an `rfc822msgid:` search. Gmail threads a draft only if the draft resource
+carries the threadId — In-Reply-To/References in the raw message are ignored
+for the mailbox's own threading (they still matter for the recipients).
+Returns nothing (with a warning) if the search is not permitted by the token's
+scope or the message isn't in the mailbox.
+"""
+function lookup_thread_id(access_token::String, msgid::AbstractString)
+    query = HTTP.escapeuri(Dict("q" => "rfc822msgid:" * strip(msgid, ['<', '>']),
+                                "maxResults" => "1"))
+    resp = HTTP.get(MESSAGES_ENDPOINT * "?" * query,
+                    ["Authorization" => "Bearer $access_token"]; status_exception = false)
+    if resp.status == 403
+        @warn "token's scope does not permit searching for the replied-to message; " *
+              "creating the draft unthreaded (re-run `$SERVICE auth` with " *
+              "\$GMAIL_SCOPE including gmail.readonly to enable this)"
+        return nothing
+    elseif resp.status != 200
+        @warn "rfc822msgid search failed (HTTP $(resp.status)); creating the draft unthreaded"
+        return nothing
+    end
+    msgs = get(JSON.parse(String(resp.body)), "messages", [])
+    if isempty(msgs)
+        @warn "replied-to message $msgid not found in this mailbox; creating the draft unthreaded"
+        return nothing
+    end
+    return String(msgs[1]["threadId"])
+end
+
+# Search (for the threadId lookup) needs a read-capable scope; we record the
+# granted scopes at auth time. Credentials from older versions lack "scope".
+can_search(creds) = occursin(r"gmail\.readonly|gmail\.modify|mail\.google\.com",
+                             get(creds, "scope", ""))
+
+function create_draft(access_token::String, rfc822::String; thread_id = nothing)
+    message = Dict{String,Any}("raw" => b64url(codeunits(rfc822)))
+    thread_id === nothing || (message["threadId"] = thread_id)
+    resp = HTTP.post(DRAFTS_ENDPOINT,
         ["Authorization" => "Bearer $access_token",
-         "Content-Type" => "message/rfc822"],
-        rfc822; status_exception = false)
+         "Content-Type" => "application/json"],
+        JSON.json(Dict("message" => message)); status_exception = false)
     resp.status == 200 || error("drafts.create failed (HTTP $(resp.status)): $(String(resp.body))")
+    return JSON.parse(String(resp.body))
+end
+
+"""
+Send the message verbatim via messages.send (scope: gmail.send). Unlike
+sending a draft from the Gmail UI — which regenerates headers (dropping
+In-Reply-To/References) and re-wraps the body — this transmits the RFC 822
+message byte-for-byte, so threading headers reach the recipients and patches
+survive `git am`.
+"""
+function send_message(access_token::String, rfc822::String)
+    resp = HTTP.post(MESSAGES_ENDPOINT * "/send",
+        ["Authorization" => "Bearer $access_token",
+         "Content-Type" => "application/json"],
+        JSON.json(Dict("raw" => b64url(codeunits(rfc822)))); status_exception = false)
+    resp.status == 200 || error("messages.send failed (HTTP $(resp.status)): $(String(resp.body))")
     return JSON.parse(String(resp.body))
 end
 
@@ -483,6 +558,11 @@ function print_usage(io::IO = stdout)
           $SERVICE draft [--to ADDR]... [--cc ADDR]... PATCH...
               Create one Gmail draft per .patch file ("-" reads stdin).
 
+          $SERVICE send [--to ADDR]... [--cc ADDR]... PATCH...
+              Send the message(s) verbatim via messages.send. Unlike the Gmail
+              UI's Send button, this preserves In-Reply-To/References and does
+              not re-wrap the patch.
+
           $SERVICE reply LORE_URL [-o FILE]
               Fetch a message from lore.kernel.org and write an editable
               reply-all template ("-o -" prints to stdout). In-Reply-To and
@@ -493,8 +573,8 @@ function print_usage(io::IO = stdout)
               Delete the stored credentials.
 
         Requires a Google Cloud OAuth client of type "Desktop app" with the
-        Gmail API enabled (scope: gmail.drafts.create, overridable via
-        \$GMAIL_SCOPE). See the README for setup.
+        Gmail API enabled (scopes: gmail.drafts.create + gmail.send,
+        overridable via \$GMAIL_SCOPE). See the README.
         """)
 end
 
@@ -524,16 +604,17 @@ function cmd_auth(args::Vector{String})
         end
         isempty(client_secret) && error("an OAuth client secret is required")
     end
-    refresh_token = oauth_authorize(String(client_id), String(client_secret))
+    refresh_token, granted_scope = oauth_authorize(String(client_id), String(client_secret))
     store_credentials(Dict(
         "client_id" => client_id,
         "client_secret" => client_secret,
         "refresh_token" => refresh_token,
+        "scope" => granted_scope,
     ))
     println("Done. Try: $SERVICE draft --to someone@example.com 0001-*.patch")
 end
 
-function cmd_draft(args::Vector{String})
+function parse_recipient_args(cmd::String, args::Vector{String})
     to = String[]; cc = String[]; files = String[]
     i = 1
     while i <= length(args)
@@ -543,7 +624,7 @@ function cmd_draft(args::Vector{String})
             push!(a == "--to" ? to : cc, args[i+1])
             i += 2
         elseif startswith(a, "--")
-            error("unknown option for draft: $a")
+            error("unknown option for $cmd: $a")
         else
             push!(files, a)
             i += 1
@@ -553,17 +634,42 @@ function cmd_draft(args::Vector{String})
     for f in files
         f == "-" || isfile(f) || error("no such file: $f")
     end
+    return to, cc, files
+end
 
+function authorized_token()
     creds = load_credentials()
     creds === nothing && error("no stored credentials — run `$SERVICE auth` first")
-    access_token = fetch_access_token(creds)
+    return creds, fetch_access_token(creds)
+end
 
+function cmd_draft(args::Vector{String})
+    to, cc, files = parse_recipient_args("draft", args)
+    creds, access_token = authorized_token()
     for f in files
         raw = f == "-" ? read(stdin, String) : read(f, String)
-        draft = create_draft(access_token, patch_to_rfc822(raw; to, cc))
-        println("created draft $(draft["id"]) from $(f == "-" ? "<stdin>" : f)")
+        rfc822 = patch_to_rfc822(raw; to, cc)
+        msgid = reply_target_msgid(rfc822)
+        thread_id = msgid !== nothing && can_search(creds) ?
+                    lookup_thread_id(access_token, msgid) : nothing
+        draft = create_draft(access_token, rfc822; thread_id)
+        threaded = thread_id === nothing ? "" : " (threaded into $thread_id)"
+        println("created draft $(draft["id"]) from $(f == "-" ? "<stdin>" : f)$threaded")
+        msgid === nothing || thread_id !== nothing ||
+            println("  note: reply drafts don't thread in the Gmail UI without a read " *
+                    "scope, and sending from the UI drops In-Reply-To — use `$SERVICE send`.")
     end
-    println("Review and send: https://mail.google.com/mail/#drafts")
+    println("Review at https://mail.google.com/mail/#drafts, then send with `$SERVICE send`.")
+end
+
+function cmd_send(args::Vector{String})
+    to, cc, files = parse_recipient_args("send", args)
+    _, access_token = authorized_token()
+    for f in files
+        raw = f == "-" ? read(stdin, String) : read(f, String)
+        sent = send_message(access_token, patch_to_rfc822(raw; to, cc))
+        println("sent $(sent["id"]) from $(f == "-" ? "<stdin>" : f)")
+    end
 end
 
 function (@main)(args)
@@ -579,6 +685,8 @@ function (@main)(args)
             cmd_auth(rest)
         elseif cmd == "draft"
             cmd_draft(rest)
+        elseif cmd == "send"
+            cmd_send(rest)
         elseif cmd == "reply"
             cmd_reply(rest)
         elseif cmd == "logout"
