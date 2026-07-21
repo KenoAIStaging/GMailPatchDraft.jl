@@ -1,6 +1,6 @@
 module GMailPatchDraft
 
-using Base64: base64encode
+using Base64: base64encode, base64decode
 using HTTP
 using JSON
 using Random: RandomDevice
@@ -313,6 +313,158 @@ function create_draft(access_token::String, rfc822::String)
 end
 
 # ---------------------------------------------------------------------------
+# lore.kernel.org → reply-all template
+# ---------------------------------------------------------------------------
+
+function qp_decode(s::AbstractString)
+    s = replace(s, r"=\r?\n" => "")  # soft line breaks
+    bytes = codeunits(s)
+    io = IOBuffer()
+    i = 1
+    while i <= length(bytes)
+        if bytes[i] == UInt8('=') && i + 2 <= length(bytes) &&
+           all(c -> c in '0':'9' || c in 'A':'F' || c in 'a':'f', Char.(bytes[i+1:i+2]))
+            write(io, parse(UInt8, String(bytes[i+1:i+2]); base = 16))
+            i += 3
+        else
+            write(io, bytes[i])
+            i += 1
+        end
+    end
+    return String(take!(io))
+end
+
+# Decode RFC 2047 encoded-words for display (attribution line). Only UTF-8 /
+# US-ASCII charsets are decoded; anything else is left as-is.
+function decode_rfc2047(s::AbstractString)
+    s = replace(s, r"\?=\s+=\?" => "?==?")  # whitespace between adjacent words is ignored
+    return replace(s, r"=\?[^?]+\?[BbQq]\?[^?]*\?=" => function (w)
+        m = match(r"^=\?([^?]+)\?([BbQq])\?([^?]*)\?=$", w)
+        charset, enc, txt = lowercase(m.captures[1]), uppercase(m.captures[2]), m.captures[3]
+        startswith(charset, "utf-8") || startswith(charset, "us-ascii") || return w
+        return enc == "B" ? String(base64decode(txt)) : qp_decode(replace(txt, "_" => " "))
+    end)
+end
+
+addr_spec(a::AbstractString) =
+    (m = match(r"<([^<>]+)>", a); lowercase(strip(m === nothing ? a : m.captures[1])))
+
+function unique_by_spec(addrs)
+    seen = Set{String}()
+    return filter(a -> !in(addr_spec(a), seen) && (push!(seen, addr_spec(a)); true), addrs)
+end
+
+"""
+Build a reply-all template (an editable RFC 822 message) from a raw message as
+served by `https://lore.kernel.org/<list>/<msgid>/raw`. Threading is preserved
+via In-Reply-To/References (plus the matching `Re:` subject), which is what
+both Gmail and the recipients' clients use to place the reply in the thread.
+`my_email` (typically `git config user.email`) is dropped from the recipients.
+"""
+function build_reply(msg::AbstractString; my_email::AbstractString = "")
+    if startswith(msg, "From ")
+        nl = findfirst('\n', msg)
+        msg = nl === nothing ? "" : SubString(msg, nl + 1)
+    end
+    sep = findfirst("\n\n", msg)
+    hdr = sep === nothing ? String(msg) : String(SubString(msg, 1, first(sep) - 1))
+    body = sep === nothing ? "" : String(SubString(msg, last(sep) + 1))
+
+    headers = Dict{String,String}()
+    for (_, unfolded) in unfold_headers(hdr)
+        m = match(r"^([!-9;-~]+):\s*(.*)$", unfolded)
+        m === nothing || (headers[lowercase(m.captures[1])] = m.captures[2])
+    end
+
+    msgid = String(strip(get(headers, "message-id", "")))
+    isempty(msgid) && error("message has no Message-ID header — cannot thread a reply")
+
+    subject = get(headers, "subject", "")
+    occursin(r"^\s*Re:"i, subject) || (subject = "Re: " * subject)
+
+    # reply-all: To = Reply-To (or From) + original To, Cc = original Cc,
+    # minus ourselves and duplicates
+    sender = get(headers, "reply-to", get(headers, "from", ""))
+    notme(a) = isempty(my_email) || addr_spec(a) != lowercase(strip(my_email))
+    to = unique_by_spec(filter(notme, [split_addresses(sender); split_addresses(get(headers, "to", ""))]))
+    to_specs = Set(addr_spec.(to))
+    cc = unique_by_spec(filter(a -> notme(a) && !in(addr_spec(a), to_specs),
+                               split_addresses(get(headers, "cc", ""))))
+
+    refs = String.(split(get(headers, "references", "")))
+    push!(refs, msgid)
+
+    # body: undo transfer encoding and mboxrd From-escaping, then quote
+    cte = lowercase(strip(get(headers, "content-transfer-encoding", "")))
+    if cte == "base64"
+        body = String(base64decode(filter(!isspace, body)))
+    elseif cte == "quoted-printable"
+        body = qp_decode(body)
+    end
+    startswith(lowercase(get(headers, "content-type", "")), "multipart/") &&
+        @warn "original message is multipart; quoting the raw body"
+    body = replace(body, r"^>(>*From )"m => s"\1")
+    quoted = join((isempty(l) ? ">" : startswith(l, ">") ? ">" * l : "> " * l
+                   for l in split(chomp(body), '\n')), '\n')
+
+    io = IOBuffer()
+    isempty(to) || println(io, "To: ", join(to, ",\n    "))
+    isempty(cc) || println(io, "Cc: ", join(cc, ",\n    "))
+    println(io, "Subject: ", subject)
+    println(io, "In-Reply-To: ", msgid)
+    println(io, "References: ", join(refs, "\n    "))
+    println(io)
+    println(io, "On ", get(headers, "date", "an unknown date"), ", ",
+            decode_rfc2047(sender), " wrote:")
+    println(io, quoted)
+    return String(take!(io)), msgid
+end
+
+function cmd_reply(args::Vector{String})
+    url = outpath = nothing
+    i = 1
+    while i <= length(args)
+        a = args[i]
+        if a in ("-o", "--output")
+            i == length(args) && error("$a requires a value")
+            outpath = args[i+1]; i += 2
+        elseif startswith(a, "-") && a != "-"
+            error("unknown option for reply: $a")
+        elseif url === nothing
+            url = a; i += 1
+        else
+            error("reply takes a single URL")
+        end
+    end
+    url === nothing && error("no lore URL given")
+
+    rawurl = endswith(url, "/raw") ? url :
+             endswith(url, "/")    ? url * "raw" : url * "/raw"
+    resp = HTTP.get(rawurl; status_exception = false)
+    resp.status == 200 || error("fetching $rawurl failed (HTTP $(resp.status))")
+
+    my_email = try
+        strip(read(`git config user.email`, String))
+    catch
+        ""
+    end
+    reply, msgid = build_reply(String(resp.body); my_email)
+
+    if outpath === nothing
+        outpath = "reply-" * replace(strip(msgid, ['<', '>']), r"[^A-Za-z0-9._@-]" => "-") * ".txt"
+    end
+    outpath != "-" && isfile(outpath) &&
+        error("$outpath already exists — pass -o to choose another name")
+    if outpath == "-"
+        print(reply)
+    else
+        write(outpath, reply)
+        println("Reply template written to $outpath")
+        println("Edit it, then create the draft with: $SERVICE draft $outpath")
+    end
+end
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -328,6 +480,12 @@ function print_usage(io::IO = stdout)
 
           $SERVICE draft [--to ADDR]... [--cc ADDR]... PATCH...
               Create one Gmail draft per .patch file ("-" reads stdin).
+
+          $SERVICE reply LORE_URL [-o FILE]
+              Fetch a message from lore.kernel.org and write an editable
+              reply-all template ("-o -" prints to stdout). In-Reply-To and
+              References are set from the Message-ID, so `draft`ing the edited
+              file threads the reply correctly.
 
           $SERVICE logout
               Delete the stored credentials.
@@ -419,6 +577,8 @@ function (@main)(args)
             cmd_auth(rest)
         elseif cmd == "draft"
             cmd_draft(rest)
+        elseif cmd == "reply"
+            cmd_reply(rest)
         elseif cmd == "logout"
             delete_credentials()
             println("Stored credentials deleted.")
