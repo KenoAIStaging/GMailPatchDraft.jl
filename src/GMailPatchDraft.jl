@@ -9,14 +9,19 @@ using Sockets
 
 const SERVICE = "gmail-patch-draft"
 # The granular drafts-only scope (visible in the Cloud Console's scope list;
-# the API reference still lags behind). Override with $GMAIL_SCOPE
-# (space-separated) — e.g. .../auth/gmail.compose for projects where the
-# granular scope isn't offered.
-const DEFAULT_SCOPE = "https://www.googleapis.com/auth/gmail.drafts.create"
+# the API reference still lags behind), plus gmail.send for `send`: the Gmail
+# UI's Send button re-serializes the draft (hard-wrapping lines, converting
+# tabs, regenerating headers) even when the draft is attached to a thread, so
+# patches must go out via messages.send, which transmits the raw message
+# verbatim. Override with $GMAIL_SCOPE (space-separated) — e.g.
+# .../auth/gmail.compose for projects where the granular scope isn't offered.
+const DEFAULT_SCOPE = "https://www.googleapis.com/auth/gmail.drafts.create " *
+                      "https://www.googleapis.com/auth/gmail.send"
 scope() = get(ENV, "GMAIL_SCOPE", DEFAULT_SCOPE)
 const AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 const TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 const DRAFTS_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
+const MESSAGES_ENDPOINT = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 
 b64url(bytes) = String(rstrip(replace(base64encode(bytes), '+' => '-', '/' => '_'), '='))
 
@@ -366,6 +371,25 @@ function create_draft(access_token::String, rfc822::String; thread_id = nothing)
     return JSON.parse(String(resp.body))
 end
 
+"""
+Send the message verbatim via messages.send (scope: gmail.send). Unlike the
+Gmail UI's Send button — which re-serializes the draft, hard-wrapping lines,
+converting tabs, and regenerating headers even when the draft is attached to
+a thread — this transmits the RFC 822 message byte-for-byte, so threading
+headers reach the recipients and patches survive `git am`. An optional
+thread_id additionally threads the sent copy in the sender's own mailbox.
+"""
+function send_message(access_token::String, rfc822::String; thread_id = nothing)
+    message = Dict{String,Any}("raw" => b64url(codeunits(rfc822)))
+    thread_id === nothing || (message["threadId"] = thread_id)
+    resp = HTTP.post(MESSAGES_ENDPOINT * "/send",
+        ["Authorization" => "Bearer $access_token",
+         "Content-Type" => "application/json"],
+        JSON.json(message); status_exception = false)
+    resp.status == 200 || error("messages.send failed (HTTP $(resp.status)): $(String(resp.body))")
+    return JSON.parse(String(resp.body))
+end
+
 # ---------------------------------------------------------------------------
 # lore.kernel.org → reply-all template
 # ---------------------------------------------------------------------------
@@ -536,11 +560,19 @@ function print_usage(io::IO = stdout)
 
           $SERVICE draft [--to ADDR]... [--cc ADDR]... [--thread-id ID] PATCH...
               Create one Gmail draft per .patch file ("-" reads stdin).
-              --thread-id attaches the draft(s) to an existing Gmail thread —
-              required for a reply to thread correctly when sent from the
-              Gmail UI. Accepts the hex API threadId, msg-f:<decimal> from the
-              UI's "Show original" URL, or the FMfcgz… token straight from the
-              Gmail web UI's URL bar when viewing the thread.
+              --thread-id attaches the draft(s) to an existing Gmail thread so
+              the review copy shows up in the right conversation. Accepts the
+              hex API threadId, msg-f:<decimal> from the UI's "Show original"
+              URL, or the FMfcgz… token straight from the Gmail web UI's URL
+              bar when viewing the thread.
+
+          $SERVICE send [--to ADDR]... [--cc ADDR]... [--thread-id ID] PATCH...
+              Send the message(s) verbatim via messages.send. The Gmail UI's
+              Send button re-wraps lines and regenerates headers even for
+              drafts attached to a thread — this doesn't. --thread-id
+              additionally threads the sent copy in your own mailbox;
+              recipients thread by the In-Reply-To/References headers either
+              way.
 
           $SERVICE reply LORE_URL [-o FILE]
               Fetch a message from lore.kernel.org and write an editable
@@ -552,8 +584,8 @@ function print_usage(io::IO = stdout)
               Delete the stored credentials.
 
         Requires a Google Cloud OAuth client of type "Desktop app" with the
-        Gmail API enabled (scope: gmail.drafts.create, overridable via
-        \$GMAIL_SCOPE). See the README for setup.
+        Gmail API enabled (scopes: gmail.drafts.create + gmail.send,
+        overridable via \$GMAIL_SCOPE). See the README for setup.
         """)
 end
 
@@ -620,18 +652,33 @@ function parse_recipient_args(cmd::String, args::Vector{String})
     return to, cc, files, thread_id
 end
 
-function cmd_draft(args::Vector{String})
-    to, cc, files, thread_id = parse_recipient_args("draft", args)
+function authorized_token()
     creds = load_credentials()
     creds === nothing && error("no stored credentials — run `$SERVICE auth` first")
-    access_token = fetch_access_token(creds)
+    return fetch_access_token(creds)
+end
+
+function cmd_draft(args::Vector{String})
+    to, cc, files, thread_id = parse_recipient_args("draft", args)
+    access_token = authorized_token()
     for f in files
         raw = f == "-" ? read(stdin, String) : read(f, String)
         draft = create_draft(access_token, patch_to_rfc822(raw; to, cc); thread_id)
         threaded = thread_id === nothing ? "" : " (threaded into $thread_id)"
         println("created draft $(draft["id"]) from $(f == "-" ? "<stdin>" : f)$threaded")
     end
-    println("Review and send: https://mail.google.com/mail/#drafts")
+    println("Review at https://mail.google.com/mail/#drafts — then send the same " *
+            "file with `$SERVICE send` (the UI's Send button re-wraps lines).")
+end
+
+function cmd_send(args::Vector{String})
+    to, cc, files, thread_id = parse_recipient_args("send", args)
+    access_token = authorized_token()
+    for f in files
+        raw = f == "-" ? read(stdin, String) : read(f, String)
+        sent = send_message(access_token, patch_to_rfc822(raw; to, cc); thread_id)
+        println("sent $(sent["id"]) from $(f == "-" ? "<stdin>" : f)")
+    end
 end
 
 function (@main)(args)
@@ -647,6 +694,8 @@ function (@main)(args)
             cmd_auth(rest)
         elseif cmd == "draft"
             cmd_draft(rest)
+        elseif cmd == "send"
+            cmd_send(rest)
         elseif cmd == "reply"
             cmd_reply(rest)
         elseif cmd == "logout"

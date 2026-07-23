@@ -19,12 +19,21 @@ for the API responses; everything else is stdlib.
    Note the client ID and client secret. (For installed apps the "secret" is
    not actually confidential; PKCE is used regardless.)
 
-The requested scope is `https://www.googleapis.com/auth/gmail.drafts.create` —
-the granular drafts-only scope (it cannot send or read mail). It appears in
-the Cloud Console's scope list even though the Gmail API reference docs still
-lag behind. If your project doesn't offer it, set
-`GMAIL_SCOPE=https://www.googleapis.com/auth/gmail.compose` before running
-`auth` to fall back to the older scope.
+Two scopes are requested by default:
+
+- `https://www.googleapis.com/auth/gmail.drafts.create` — the granular
+  drafts-only scope. It appears in the Cloud Console's scope list even though
+  the Gmail API reference docs still lag behind.
+- `https://www.googleapis.com/auth/gmail.send` — for the `send` subcommand.
+  This exists because the Gmail UI's Send button re-serializes the draft on
+  send — hard-wrapping lines, converting tabs, regenerating headers — even
+  when the draft is attached to the right thread, which corrupts patches and
+  strips reply threading for recipients. `send` transmits the RFC 822 message
+  byte-for-byte via `messages.send` instead. Neither scope can read mail.
+
+Set `GMAIL_SCOPE` (space-separated) before `auth` to override — e.g. only
+`gmail.drafts.create` for a draft-only token, or `gmail.compose` for projects
+where the granular scopes aren't offered.
 
 ## Install
 
@@ -65,6 +74,11 @@ git format-patch --stdout -1 HEAD | gmail-patch-draft draft --to reviewer@exampl
 gmail-patch-draft reply https://lore.kernel.org/lkml/87bjc0led9.ffs@fw13/
 $EDITOR reply-87bjc0led9.ffs@fw13.txt
 gmail-patch-draft draft --thread-id FMfcgzQhVWwLZMnDwNWCdxPKKSXRLgKp reply-87bjc0led9.ffs@fw13.txt
+
+# After reviewing the draft in Gmail, send the same file verbatim via the
+# API — do NOT use the UI's Send button, which re-wraps lines and drops the
+# threading headers (discard the review draft afterwards):
+gmail-patch-draft send --thread-id FMfcgzQhVWwLZMnDwNWCdxPKKSXRLgKp reply-87bjc0led9.ffs@fw13.txt
 
 # Forget the stored credentials:
 gmail-patch-draft logout
@@ -107,14 +121,15 @@ gmail-patch-draft draft --thread-id ID reply-….txt
   a thread's id equals its first message's id);
 - the hex API threadId itself.
 
-With the draft attached to the thread, the UI composer treats it as a reply
-to that conversation and generates correct threading headers itself at send
-time.
-
-One caveat for patches (as opposed to prose replies): the UI's Send button
-also re-wraps long lines and converts tabs, which corrupts a patch for
-`git am`. Prefer sending patch mails with a client that transmits the draft
-verbatim.
+Attaching the draft to the thread makes the review copy appear in the right
+conversation. **Don't send it from the UI though**: the Send button
+re-serializes the draft even when it's correctly threaded — lines get
+hard-wrapped (corrupting patches for `git am`) and the threading headers are
+regenerated rather than preserved. Send the same file with
+`gmail-patch-draft send` instead, which transmits it byte-for-byte; pass the
+same `--thread-id` so the sent copy lands in the conversation in your own
+mailbox too (recipients thread by the In-Reply-To/References headers either
+way). The draft is a review copy — discard it after sending.
 
 ## Security notes
 
